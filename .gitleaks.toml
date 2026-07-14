@@ -1,0 +1,8 @@
+title = "AWS DevSecOps Project Gitleaks Configuration"
+
+[allowlist]
+description = "Allow example or test values"
+paths = [
+  '''package-lock.json''',
+  '''CHANGELOG.md'''
+]
