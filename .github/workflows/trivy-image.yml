@@ -2,7 +2,7 @@ name: Trivy Image Scan
 
 on:
   workflow_run:
-    workflows: ["Product Catalog CI"]
+    workflows: ["product-catalog-ci"]
     types:
       - completed
 
