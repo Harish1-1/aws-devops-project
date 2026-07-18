@@ -77,7 +77,7 @@ jobs:
           cache-dependency-path: src/product-catalog/go.sum
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v8
+        uses: golangci/golangci-lint-action@v9
         with:
           version: latest
           working-directory: src/product-catalog
