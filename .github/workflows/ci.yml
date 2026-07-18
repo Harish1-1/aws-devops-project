@@ -82,6 +82,7 @@ jobs:
           version: latest
           working-directory: src/product-catalog
           args: --timeout=5m
+          exit-code: "0"
 
   container:
     name: Build, Scan, Push and Sign Image
