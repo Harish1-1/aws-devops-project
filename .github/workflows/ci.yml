@@ -1,0 +1,217 @@
+name: Product Catalog CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/product-catalog/**"
+      - "kubernetes/productcatalog/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/product-catalog/**"
+      - "kubernetes/productcatalog/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: product-catalog-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+
+env:
+  SERVICE_PATH: src/product-catalog
+  IMAGE_NAME: product-catalog
+
+jobs:
+  build-test:
+    name: Build and Unit Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: src/product-catalog/go.mod
+          cache-dependency-path: src/product-catalog/go.sum
+
+      - name: Download dependencies
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: go mod download
+
+      - name: Build
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: go build -trimpath -o product-catalog-service .
+
+      - name: Unit tests
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Upload test coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: product-catalog-coverage
+          path: src/product-catalog/coverage.out
+          if-no-files-found: error
+          retention-days: 14
+
+  code-quality:
+    name: Go Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: src/product-catalog/go.mod
+          cache-dependency-path: src/product-catalog/go.sum
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          working-directory: src/product-catalog
+          args: --timeout=5m
+
+  container:
+    name: Build, Scan, Push and Sign Image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build-test, code-quality]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      image: ${{ steps.image.outputs.reference }}
+      digest: ${{ steps.push.outputs.digest }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Validate Docker Hub secrets
+        shell: bash
+        run: |
+          test -n "${{ secrets.DOCKER_USERNAME }}" || { echo "DOCKER_USERNAME is missing"; exit 1; }
+          test -n "${{ secrets.DOCKER_TOKEN }}" || { echo "DOCKER_TOKEN is missing"; exit 1; }
+
+      - name: Set image reference
+        id: image
+        shell: bash
+        run: echo "reference=${{ secrets.DOCKER_USERNAME }}/${IMAGE_NAME}:${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Build image locally for security checks
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.SERVICE_PATH }}
+          file: ${{ env.SERVICE_PATH }}/Dockerfile
+          load: true
+          push: false
+          tags: ${{ steps.image.outputs.reference }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.reference }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0" # Change to "1" after fixing accepted HIGH/CRITICAL findings.
+
+      - name: Generate image SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.image.outputs.reference }}
+          format: spdx-json
+          output-file: sbom-product-catalog.spdx.json
+          upload-artifact: false
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: product-catalog-sbom-${{ github.run_id }}
+          path: sbom-product-catalog.spdx.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Push image
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.SERVICE_PATH }}
+          file: ${{ env.SERVICE_PATH }}/Dockerfile
+          push: true
+          tags: ${{ steps.image.outputs.reference }}
+          cache-from: type=gha
+          provenance: true
+          sbom: true
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4
+
+      - name: Sign image by digest with keyless Cosign
+        env:
+          COSIGN_YES: "true"
+          IMAGE: ${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign "${IMAGE}@${DIGEST}"
+
+  update-manifest:
+    name: Update Kubernetes Manifest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: container
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Update product-catalog image tag
+        shell: bash
+        run: |
+          sed -i "s|image: .*product-catalog.*|image: ${{ needs.container.outputs.image }}|" kubernetes/productcatalog/deploy.yaml
+          grep -n "image:" kubernetes/productcatalog/deploy.yaml
+
+      - name: Commit and push manifest
+        shell: bash
+        run: |
+          if git diff --quiet -- kubernetes/productcatalog/deploy.yaml; then
+            echo "Manifest already contains the requested image."
+            exit 0
+          fi
+
+          git config user.name "Harish Kumar"
+          git config user.email "gundaharishkumar2@gmail.com"
+          git add kubernetes/productcatalog/deploy.yaml
+          git commit -m "chore(gitops): update product-catalog image to run ${GITHUB_RUN_ID} [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main

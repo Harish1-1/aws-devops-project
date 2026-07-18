@@ -1,8 +1,8 @@
-title = "AWS DevSecOps Project Gitleaks Configuration"
+title = "AWS DevOps Project Gitleaks Configuration"
 
 [allowlist]
-description = "Allow example or test values"
+description = "Ignore generated and non-secret files only"
 paths = [
-  '''package-lock.json''',
-  '''CHANGELOG.md'''
+  '''(^|/)package-lock\.json$''',
+  '''(^|/)CHANGELOG\.md$'''
 ]
